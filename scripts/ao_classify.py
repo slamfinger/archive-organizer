@@ -71,7 +71,7 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
                 if _protected(rel, os.path.getsize(abs_), prot):
                     n_prot += 1
                     continue
-                plan.append((idx, abs_, os.path.join(dst_abs, os.path.basename(abs_))))
+                plan.append((idx, abs_, os.path.join(dst_abs, os.path.basename(abs_)), None))
             continue
         src_abs = os.path.join(root, src)
         if not os.path.isdir(src_abs):
@@ -88,13 +88,13 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
                 n_prot += 1
                 continue
             tail = rel if keep else os.path.basename(rel)
-            plan.append((idx, abs_, os.path.join(dst_abs, tail)))
+            plan.append((idx, abs_, os.path.join(dst_abs, tail), None))
     if n_prot:
         print(f"[保护] 按人工保护清单跳过 {n_prot} 个文件（人工调整不回改）")
     # 冲突可见化：被多条规则命中（目标不同）的文件，干跑阶段列给人看。
     # 裁决仍按既定契约「规则顺序先到先得」，不阻断——要改顺序请调整规则表。
     multi = defaultdict(set)
-    for idx, s_abs, d_abs in plan:
+    for idx, s_abs, d_abs, _sz in plan:
         multi[s_abs].add((idx, os.path.relpath(d_abs, root)))
     conflicts = {s: v for s, v in multi.items() if len({d for _i, d in v}) > 1}
     if conflicts:
@@ -111,15 +111,19 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
 def apply_plan(plan, root, journal_path, confirm=False, batch=None):
     journal = Journal(journal_path)
     moved = skipped = 0
+    drifted = 0
     touched_rules = set()  # 真正搬走文件的规则，事后才清理其源目录空壳
     try:
-        for i, (idx, src_abs, dst_abs) in enumerate(plan):
+        for i, (idx, src_abs, dst_abs, plan_size) in enumerate(plan):
             if not os.path.exists(src_abs):
                 skipped += 1
                 continue
-            ensure_inside(root, dst_abs)
             rel_src = os.path.relpath(src_abs, root)
             rel_dst = os.path.relpath(dst_abs, root)
+            cur_size = os.path.getsize(src_abs)
+            if plan_size is not None and cur_size != plan_size:
+                drifted += 1
+                print(f"  [注意] 文件在计划生成后有过改动（{plan_size}B → {cur_size}B），仍按已批准计划移动: {rel_src}")
             if confirm:
                 if input(f"  移动 {rel_src} → {rel_dst} ? (y/N): ").strip().lower() != "y":
                     continue
@@ -131,6 +135,8 @@ def apply_plan(plan, root, journal_path, confirm=False, batch=None):
             moved += 1
     finally:
         journal.close()
+    if drifted:
+        print(f"  [注意] 共 {drifted} 个文件与计划时大小不同（已按批准计划移动，内容以现文件为准）")
     return moved, skipped, touched_rules
 
 
@@ -169,12 +175,12 @@ def prune_empty_dirs(start_abs, stop_abs):
 def do_execute(rules, root, ex, args, prot=frozenset()):
     plan = collect_rules_moves(rules, root, ex, prot)
     by_rule = {}
-    for idx, _, _ in plan:
+    for idx, _s, _d, _sz in plan:
         by_rule[idx] = by_rule.get(idx, 0) + 1
     print(f"[干跑将执行] 共 {len(plan)} 个文件移动：")
     for idx, (action, src, dst) in enumerate(rules):
         print(f"  规则{idx + 1} {action}: {src} → {dst}  ({by_rule.get(idx, 0)}个文件)")
-    for idx, src_abs, dst_abs in plan[:args.samples]:
+    for idx, src_abs, dst_abs, _sz in plan[:args.samples]:
         print(f"    例: {os.path.relpath(src_abs, root)} → {os.path.relpath(dst_abs, root)}")
     if len(plan) > args.samples:
         print(f"    …（其余 {len(plan) - args.samples} 条略）")

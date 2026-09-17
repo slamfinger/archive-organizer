@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
-"""逐文件映射总表回放器：把「映射总表.csv」（一行一文件：现相对路径,新相对路径）
-批量落位。骨架重排、跨机对齐、迁移回放共用这一机制。
+"""逐文件映射总表回放器：把「映射总表.csv」批量落位。骨架重排、跨机对齐、迁移回放共用。
 
-与 ao_classify.py 同一套安全纪律：
-- 默认干跑，--execute 才真移动；
-- 日志与 ao_classify 兼容（jsonl: time/src/dst 相对路径），ao_classify --undo 可整体回滚；
-- 目标重名自动加 " (n)" 序号，绝不覆盖；
-- 移动后自底向上清理搬空的目录壳（工作目录除外，非空即停）。
+映射总表两列（现相对路径,新相对路径）或三列（第三列=计划时大小，ao_remap 生成）。
+第三列用于 TOCTOU 核对：映射是跨 invocation 的持久化计划，若源文件在生成映射后
+被改动（大小不一致），预检逐条提示——落位仍按已批准映射执行，内容以现文件为准。
 
-预检守卫（血泪教训固化为规则）：
-- 源必须存在、不得重复、不得等于目标；
-- 同一目标字符串被 ≥3 行共享 → 判定为「目录槽当文件目标」事故，拒绝执行
-  （散件分派必须拼上文件名；≤2 行共享视为版本件共存，放行并提示）。"""
+安全纪律（与 ao_classify 相同 + 预检错误分级）：
+- 默认干跑，--execute 才真移动；日志与 ao_classify 兼容（jsonl: time/batch/src/dst），
+  ao_classify --undo / --undo-last 可回滚；
+- 目标重名自动加 " (n)" 序号，绝不覆盖；移动后清理搬空的目录壳；
+- 预检分级：hard（源缺失/重复/越界/垃圾/非法路径）任何参数不可放行；
+  shared（≥3 行共享同一目标=目录槽事故嫌疑）仅 --allow-shared-dst 豁免。
+"""
 import os
 import argparse
 from collections import Counter
@@ -29,24 +29,31 @@ def is_junk(name):
 
 
 def load_pairs(path):
+    """兼容两列（旧版）与三列（含计划时大小）映射表。"""
     rows = read_csv_rows(path)
     if len(rows) < 2:
         raise SystemExit(f"[错误] 映射表为空: {path}")
-    return [(r[0].strip(), r[1].strip()) for r in rows[1:] if len(r) >= 2 and r[0].strip()]
+    pairs = []
+    for r in rows[1:]:
+        if len(r) < 2 or not r[0].strip():
+            continue
+        size = r[2].strip() if len(r) > 2 and r[2].strip() else None
+        pairs.append((r[0].strip(), r[1].strip(), int(size) if size else None))
+    return pairs
 
 
 def preflight(pairs, root):
-    """错误分级：hard = 任何情况下不可执行；shared = 目录槽事故嫌疑，仅 --allow-shared-dst 可豁免。"""
-    hard, shared, warns = [], [], []
+    """错误分级：hard = 任何情况下不可执行；shared = 目录槽事故嫌疑，仅可被 --allow-shared-dst 豁免。"""
+    hard, shared, warns, drifts = [], [], [], []
     src_seen, dst_cnt = {}, Counter()
-    root_abs = os.path.abspath(root)
+    root_abs = os.path.realpath(root)
 
     def boundary(p):
         if not p:
             return "空路径"
         if p.endswith(os.sep) or p.endswith("/"):
             return "路径以分隔符结尾（疑似目录槽）"
-        ap = os.path.abspath(os.path.join(root_abs, p))
+        ap = os.path.realpath(os.path.join(root_abs, p))
         if ap == root_abs:
             return "目标为归档根本身"
         try:
@@ -55,7 +62,7 @@ def preflight(pairs, root):
             return "越界路径"
         return None
 
-    for s, d in pairs:
+    for s, d, plan_size in pairs:
         if s in src_seen:
             hard.append(f"源重复: {s}")
         src_seen[s] = d
@@ -69,21 +76,24 @@ def preflight(pairs, root):
         e = boundary(d)
         if e:
             hard.append(f"目标非法（{e}）: {d}")
-        if not os.path.isfile(os.path.join(root, s)):
+        s_abs = os.path.join(root, s)
+        if not os.path.isfile(s_abs):
             hard.append(f"源不存在: {s}")
+        elif plan_size is not None and os.path.getsize(s_abs) != plan_size:
+            drifts.append((s, plan_size, os.path.getsize(s_abs)))
         dst_cnt[d] += 1
     for d, n in dst_cnt.items():
         if n >= 3:
             shared.append(f"目标被{n}行共享（疑似目录槽当文件目标）: {d}")
         elif n == 2:
             warns.append(f"同目标2行（版本件将序号共存）: {d}")
-    return hard, shared, warns
+    return hard, shared, warns, drifts
 
 
 def main():
     ap = argparse.ArgumentParser(description="逐文件映射总表回放（默认干跑）")
     ap.add_argument("--root", required=True)
-    ap.add_argument("--map", required=True, help="映射总表.csv（现相对路径,新相对路径）")
+    ap.add_argument("--map", required=True, help="映射总表.csv（现相对路径,新相对路径[,计划时大小]）")
     ap.add_argument("--journal", default=None, help="日志路径（默认 <root>/归档整理/.ao_journal.jsonl）")
     ap.add_argument("--execute", action="store_true")
     ap.add_argument("--allow-shared-dst", action="store_true",
@@ -96,21 +106,23 @@ def main():
     journal_path = args.journal or os.path.join(workdir(root), ".ao_journal.jsonl")
 
     pairs = load_pairs(args.map)
-    hard, shared, warns = preflight(pairs, root)
+    hard, shared, warns, drifts = preflight(pairs, root)
 
     # 人工保护衔接：映射按「文件名+大小」对齐保护清单，命中即知悉提示。
     # 映射是整体已审方案（remap 从现树生成，人工调整后的现位置即映射源），
     # 故不阻断，但要让人看见；增量规则请勿回改这些文件。
     prot = load_protect(root)
     n_prot = 0
-    for s, _d in pairs:
-        ap = os.path.join(root, s)
-        if os.path.isfile(ap) and protect_key(s, os.path.getsize(ap)) in prot:
+    for s, _d, _sz in pairs:
+        ap_ = os.path.join(root, s)
+        if os.path.isfile(ap_) and protect_key(s, os.path.getsize(ap_)) in prot:
             n_prot += 1
     if n_prot:
         print(f"    [知悉] 映射含 {n_prot} 个人工保护清单文件（整体重排属正常落位）")
 
     print(f"[预检] {len(pairs)} 条映射")
+    for s, planned, now in drifts:
+        print(f"    [漂移] {s[:66]} 计划时{planned}B → 现在{now}B（仍按已批准映射落位，内容以现文件为准）")
     for w in warns:
         print("    [注意]", w)
     if hard:
@@ -131,7 +143,7 @@ def main():
         was = ensure_unlocked(root)
         try:
             with open(journal_path, "a", encoding="utf-8") as jf:
-                for i, (s, d) in enumerate(pairs, 1):
+                for i, (s, d, _sz) in enumerate(pairs, 1):
                     s_abs, d_abs = os.path.join(root, s), os.path.join(root, d)
                     if not os.path.exists(s_abs):
                         print(f"  [跳过] 源已消失: {s}")

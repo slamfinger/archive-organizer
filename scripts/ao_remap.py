@@ -116,12 +116,12 @@ def report(rules_path, out_path, root, wd, rules, args):
             if hit is None:
                 unassigned.append(rel)
                 continue
-            pairs.append((rel, hit))
+            pairs.append((rel, hit, os.path.getsize(os.path.join(root, rel))))
             matrix[rel.split(os.sep)[0]][hit.split("/")[0]] += 1
 
     with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
         w = csv.writer(f)
-        w.writerow(["现相对路径", "新相对路径"])
+        w.writerow(["现相对路径", "新相对路径", "计划时大小"])
         w.writerows(pairs)
 
     print(f"映射 {len(pairs)} 条 → {out_path}")

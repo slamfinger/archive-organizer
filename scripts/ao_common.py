@@ -89,13 +89,14 @@ def walk_rel(root, ex):
 
 # ---------- 路径安全 ----------
 def ensure_inside(root, target):
-    """目标路径必须落在归档根内，拒绝 ../ 越界。"""
-    root_a, target_a = os.path.abspath(root), os.path.abspath(target)
+    """目标路径必须落在归档根内，拒绝 ../ 越界与符号链接穿透（realpath 解析）。"""
+    root_abs = os.path.realpath(root)
+    target_abs = os.path.realpath(target)
     try:
-        if os.path.commonpath([root_a, target_a]) != root_a:
-            raise SystemExit(f"[拒绝] 路径越出归档根 {root_a}: {target_a}")
+        if os.path.commonpath([root_abs, target_abs]) != root_abs:
+            raise SystemExit(f"[拒绝] 路径越出归档根 {root_abs}: {target}")
     except ValueError:  # Windows 跨盘等场景
-        raise SystemExit(f"[拒绝] 路径越出归档根 {root_a}: {target_a}")
+        raise SystemExit(f"[拒绝] 路径越出归档根 {root_abs}: {target}")
 
 
 def unique_dst(dst):
@@ -156,12 +157,18 @@ class Journal:
     def entries(cls, path):
         if not os.path.exists(path):
             return []
-        out = []
+        out, bad = [], 0
         with open(path, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if line:
+                if not line:
+                    continue
+                try:
                     out.append(json.loads(line))
+                except json.JSONDecodeError:
+                    bad += 1  # 中断残留的半行：跳过，不让整份日志报废
+        if bad:
+            print(f"[警告] 日志中有 {bad} 行损坏（多为中断残留），已跳过；其余 {len(out)} 条可正常回放。")
         return out
 
 
