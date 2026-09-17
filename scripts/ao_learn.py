@@ -43,7 +43,13 @@ def moved_pairs(root, snap_path):
         if not olds:
             continue
         if len(olds) > 1:
-            ambiguous.append((rel, olds))  # 审计P1-1：同名同大小多候选，来源歧义拒学防污染
+            # 多候选——用「空位」消解：恰好一个候选路径已被腾空，它就是真实来源；
+            # 两个都在或都已腾空则来源歧义，拒学防污染
+            gone = [o for o in olds if not os.path.exists(os.path.join(root, o))]
+            if len(gone) == 1:
+                pairs.append((gone[0], rel))
+                continue
+            ambiguous.append((rel, olds, "多候选均在原位或均已腾空，无法唯一确认来源"))
             continue
         pairs.append((olds[0], rel))
     return pairs, ambiguous, base
@@ -153,8 +159,8 @@ def main():
             print(f"   {o[:60]} → {n[:60]}")
     if ambiguous:
         print(f"歧义拒学 {len(ambiguous)} 个（同名同大小多候选，防止污染学习样本）:")
-        for rel, olds in ambiguous[:8]:
-            print(f"   ? {rel[:66]}  ← 候选来源: {' ; '.join(o[:40] for o in olds)}")
+        for rel, olds, why in ambiguous[:8]:
+            print(f"   ? {rel[:66]}  ← {why}: {' ; '.join(o[:40] for o in olds)}")
 
     known = load_known(known_paths)
     existing = []

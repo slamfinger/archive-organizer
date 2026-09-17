@@ -154,12 +154,16 @@ def prune_empty_dirs(start_abs, stop_abs):
             break
     while cur != stop:
         try:
-            if os.listdir(cur):
+            if os.path.exists(cur) and os.listdir(cur):
                 break
-            os.rmdir(cur)
         except OSError:
             break
-        cur = os.path.dirname(cur)
+        try:
+            if os.path.exists(cur):
+                os.rmdir(cur)
+        except OSError:
+            break
+        cur = os.path.dirname(cur)  # 已消失的子目录视为可清，继续向上
 
 
 def do_execute(rules, root, ex, args, prot=frozenset()):
@@ -179,6 +183,7 @@ def do_execute(rules, root, ex, args, prot=frozenset()):
         return
 
     batch = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    n_before = sum(len(fs) for r_, d_, fs in os.walk(root) if WORKDIR_NAME not in r_.split(os.sep))
     moved, skipped, touched = apply_plan(plan, root, args.journal, confirm=args.confirm, batch=batch)
     # 源目录若已搬空，清掉残留空壳（只清真搬过文件的，不动原有空目录）
     for idx in touched:
@@ -191,6 +196,9 @@ def do_execute(rules, root, ex, args, prot=frozenset()):
     print("→ 如需撤销: 同命令加 --undo-last（只回滚本批次）或 --undo（回滚全部）")
     if args.execute:
         do_snapshot(root)  # 执行成功即刷新位置基线，供下轮增量/人工调整检测
+        n_after = sum(len(fs) for r_, d_, fs in os.walk(root) if WORKDIR_NAME not in r_.split(os.sep))
+        verdict = "守恒 ✓" if n_before == n_after else "有增减，请核对！"
+        print(f"  终验：文件总数 执行前 {n_before} → 执行后 {n_after}（{verdict}）")
 
 
 def undo_entries(root, entries):
@@ -205,7 +213,9 @@ def undo_entries(root, entries):
             src_abs = unique_dst(src_abs)  # 原位已被占，放回旁边的序号位
         os.makedirs(os.path.dirname(src_abs), exist_ok=True)
         os.rename(dst_abs, src_abs)
-        prune_empty_dirs(dst_abs, root)  # 执行时新建的目标目录，回滚后顺手清空壳
+        # 清理起点是目标所在目录（文件已搬走，目录才可能空）；传文件路径会在
+        # prune 的守卫处因“已不存在”直接返回，空壳清理静默失效（三轮审计P1）
+        prune_empty_dirs(os.path.dirname(dst_abs), root)
         print(f"  {e['dst']} → {os.path.relpath(src_abs, root)}")
         undone += 1
     print(f"✓ 已回滚 {undone}/{len(entries)} 条移动。日志保留（可重复回滚追溯更早批次）。")
