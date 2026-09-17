@@ -240,8 +240,9 @@ def do_list_batches(root, args):
 def main():
     ap = argparse.ArgumentParser(description="按规则表执行文件移动（默认干跑）")
     ap.add_argument("--root", required=True, help="归档根目录")
-    ap.add_argument("--rules", default=None,
-                    help="规则CSV（默认 <root>/归档整理/归档规则.csv）")
+    ap.add_argument("--rules", action="append", default=None,
+                    help="规则CSV，可多次传入按顺序合并（默认 <root>/归档整理/归档规则.csv）；"
+                         "增量归档可同时给 --rules 归档规则.csv --rules 学习规则.csv")
     ap.add_argument("--execute", action="store_true", help="真正执行移动（缺省只干跑预览）")
     ap.add_argument("--confirm", action="store_true", help="执行前逐项确认")
     ap.add_argument("--undo", action="store_true", help="按日志逆序回滚全部移动")
@@ -276,9 +277,14 @@ def main():
         do_list_batches(root, args)
         return
 
-    if not os.path.exists(args.rules):
-        raise SystemExit(f"[错误] 规则表不存在: {args.rules}")
-    rules = load_rules(args.rules)
+    rules_paths = args.rules or [os.path.join(wd, "归档规则.csv")]
+    rules = []
+    for rp in rules_paths:
+        if not os.path.exists(rp):
+            raise SystemExit(f"[错误] 规则表不存在: {rp}")
+        rules.extend(load_rules(rp))
+    if len(rules_paths) > 1:
+        print(f"[规则] 已合并 {len(rules_paths)} 份规则表，共 {len(rules)} 条（按传入顺序裁决）")
     ex = Excludes(args.exclude)
     ex.names.add(WORKDIR_NAME)  # 移文件规则不扫产物目录
     was = ensure_unlocked(root)  # 产物目录若已锁定，先临时解锁
