@@ -17,6 +17,8 @@ import argparse
 from collections import Counter
 
 from ao_common import ensure_inside, workdir, read_csv_rows, WORKDIR_NAME
+from ao_protect import ensure_unlocked, relock
+from ao_state import do_snapshot, load_protect, protect_key
 
 JUNK_PREFIX = ("~$", "._")
 JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
@@ -76,6 +78,19 @@ def main():
 
     pairs = load_pairs(args.map)
     errs, warns = preflight(pairs, root)
+
+    # 人工保护衔接：映射按「文件名+大小」对齐保护清单，命中即知悉提示。
+    # 映射是整体已审方案（remap 从现树生成，人工调整后的现位置即映射源），
+    # 故不阻断，但要让人看见；增量规则请勿回改这些文件。
+    prot = load_protect(root)
+    n_prot = 0
+    for s, _d in pairs:
+        ap = os.path.join(root, s)
+        if os.path.isfile(ap) and protect_key(s, os.path.getsize(ap)) in prot:
+            n_prot += 1
+    if n_prot:
+        print(f"    [知悉] 映射含 {n_prot} 个人工保护清单文件（整体重排属正常落位）")
+
     print(f"[预检] {len(pairs)} 条映射")
     for w in warns:
         print("    [注意]", w)
@@ -87,39 +102,44 @@ def main():
     import json, shutil, datetime
     moved = renamed = 0
     if args.execute:
-        with open(journal_path, "a", encoding="utf-8") as jf:
-            for i, (s, d) in enumerate(pairs, 1):
-                s_abs, d_abs = os.path.join(root, s), os.path.join(root, d)
-                if not os.path.exists(s_abs):
-                    print(f"  [跳过] 源已消失: {s}")
+        was = ensure_unlocked(root)
+        try:
+            with open(journal_path, "a", encoding="utf-8") as jf:
+                for i, (s, d) in enumerate(pairs, 1):
+                    s_abs, d_abs = os.path.join(root, s), os.path.join(root, d)
+                    if not os.path.exists(s_abs):
+                        print(f"  [跳过] 源已消失: {s}")
+                        continue
+                    final = d_abs
+                    if os.path.exists(d_abs):
+                        base, ext = os.path.splitext(d_abs)
+                        k = 1
+                        while os.path.exists(f"{base} ({k}){ext}"):
+                            k += 1
+                        final = f"{base} ({k}){ext}"
+                        renamed += 1
+                    os.makedirs(os.path.dirname(final), exist_ok=True)
+                    shutil.move(s_abs, final)
+                    jf.write(json.dumps({
+                        "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "src": s, "dst": os.path.relpath(final, root)}, ensure_ascii=False) + "\n")
+                    jf.flush()
+                    moved += 1
+                    if i % 300 == 0:
+                        print(f"  … {i}/{len(pairs)}")
+            pruned = 0
+            for dirpath, dnames, _ in os.walk(root, topdown=False):
+                if os.path.abspath(dirpath) == root or WORKDIR_NAME in dirpath.split(os.sep):
                     continue
-                final = d_abs
-                if os.path.exists(d_abs):
-                    base, ext = os.path.splitext(d_abs)
-                    k = 1
-                    while os.path.exists(f"{base} ({k}){ext}"):
-                        k += 1
-                    final = f"{base} ({k}){ext}"
-                    renamed += 1
-                os.makedirs(os.path.dirname(final), exist_ok=True)
-                shutil.move(s_abs, final)
-                jf.write(json.dumps({
-                    "time": datetime.datetime.now().isoformat(timespec="seconds"),
-                    "src": s, "dst": os.path.relpath(final, root)}, ensure_ascii=False) + "\n")
-                jf.flush()
-                moved += 1
-                if i % 300 == 0:
-                    print(f"  … {i}/{len(pairs)}")
-        pruned = 0
-        for dirpath, dnames, _ in os.walk(root, topdown=False):
-            if os.path.abspath(dirpath) == root or WORKDIR_NAME in dirpath.split(os.sep):
-                continue
-            try:
-                if not os.listdir(dirpath):
-                    os.rmdir(dirpath)
-                    pruned += 1
-            except OSError:
-                pass
+                try:
+                    if not os.listdir(dirpath):
+                        os.rmdir(dirpath)
+                        pruned += 1
+                except OSError:
+                    pass
+            do_snapshot(root)  # 与 ao_classify 同：执行成功即刷新基线（须在 relock 前）
+        finally:
+            relock(root, was)
         print(f"✓ 移动 {moved} 个，序号共存 {renamed} 个，清理空目录 {pruned} 个。")
         print(f"  日志: {journal_path}（ao_classify --root {root} --undo 可整体回滚）")
     else:

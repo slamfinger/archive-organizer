@@ -23,6 +23,7 @@ import argparse
 from collections import Counter, defaultdict
 
 from ao_common import workdir, read_csv_rows, WORKDIR_NAME
+from ao_protect import ensure_unlocked, relock
 
 JUNK_PREFIX = ("~$", "._")
 JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
@@ -74,7 +75,14 @@ def main():
     if not os.path.exists(rules_path):
         raise SystemExit(f"[错误] 规则CSV不存在: {rules_path}")
     rules = load_rules(rules_path)
+    was = ensure_unlocked(root)  # 产出目录若已锁定，先临时解锁，结束恢复
+    try:
+        report(rules_path, out_path, root, wd, rules, args)
+    finally:
+        relock(root, was)
 
+
+def report(rules_path, out_path, root, wd, rules, args):
     transplants = rules["移树"]
     slots_by_scope = defaultdict(list)
     for scope, kw, dst in rules["归槽"]:
