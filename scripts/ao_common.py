@@ -124,12 +124,14 @@ class Journal:
         self.path = path
         self.fh = open(path, "a", encoding="utf-8") if enabled else None
 
-    def log(self, src, dst):
+    def log(self, src, dst, batch=None):
         if not self.fh:
             return
-        self.fh.write(json.dumps({
-            "time": datetime.datetime.now().isoformat(timespec="seconds"),
-            "src": src, "dst": dst}, ensure_ascii=False) + "\n")
+        rec = {"time": datetime.datetime.now().isoformat(timespec="seconds"),
+               "src": src, "dst": dst}
+        if batch:
+            rec["batch"] = batch
+        self.fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self.fh.flush()
 
     def close(self):

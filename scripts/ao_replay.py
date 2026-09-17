@@ -36,29 +36,48 @@ def load_pairs(path):
 
 
 def preflight(pairs, root):
-    errs, warns = [], []
+    """错误分级：hard = 任何情况下不可执行；shared = 目录槽事故嫌疑，仅 --allow-shared-dst 可豁免。"""
+    hard, shared, warns = [], [], []
     src_seen, dst_cnt = {}, Counter()
+    root_abs = os.path.abspath(root)
+
+    def boundary(p):
+        if not p:
+            return "空路径"
+        if p.endswith(os.sep) or p.endswith("/"):
+            return "路径以分隔符结尾（疑似目录槽）"
+        ap = os.path.abspath(os.path.join(root_abs, p))
+        if ap == root_abs:
+            return "目标为归档根本身"
+        try:
+            ensure_inside(root_abs, ap)
+        except SystemExit:
+            return "越界路径"
+        return None
+
     for s, d in pairs:
         if s in src_seen:
-            errs.append(f"源重复: {s}")
+            hard.append(f"源重复: {s}")
         src_seen[s] = d
         if is_junk(os.path.basename(s)):
-            errs.append(f"垃圾文件不应进映射表: {s}")
+            hard.append(f"垃圾文件不应进映射表: {s}")
         if s == d:
-            errs.append(f"源等于目标: {s}")
-        for p in (s, d):
-            ap = os.path.abspath(os.path.join(root, p))
-            if not ap.startswith(os.path.abspath(root) + os.sep):
-                errs.append(f"越界路径: {p}")
+            hard.append(f"源等于目标: {s}")
+        e = boundary(s)
+        if e:
+            hard.append(f"源非法（{e}）: {s}")
+        e = boundary(d)
+        if e:
+            hard.append(f"目标非法（{e}）: {d}")
         if not os.path.isfile(os.path.join(root, s)):
-            errs.append(f"源不存在: {s}")
+            hard.append(f"源不存在: {s}")
         dst_cnt[d] += 1
     for d, n in dst_cnt.items():
         if n >= 3:
-            errs.append(f"目标被{n}行共享（疑似目录槽当文件目标）: {d}")
+            shared.append(f"目标被{n}行共享（疑似目录槽当文件目标）: {d}")
         elif n == 2:
             warns.append(f"同目标2行（版本件将序号共存）: {d}")
-    return errs, warns
+    return hard, shared, warns
 
 
 def main():
@@ -77,7 +96,7 @@ def main():
     journal_path = args.journal or os.path.join(workdir(root), ".ao_journal.jsonl")
 
     pairs = load_pairs(args.map)
-    errs, warns = preflight(pairs, root)
+    hard, shared, warns = preflight(pairs, root)
 
     # 人工保护衔接：映射按「文件名+大小」对齐保护清单，命中即知悉提示。
     # 映射是整体已审方案（remap 从现树生成，人工调整后的现位置即映射源），
@@ -94,14 +113,21 @@ def main():
     print(f"[预检] {len(pairs)} 条映射")
     for w in warns:
         print("    [注意]", w)
-    for e in errs:
-        print("    [错误]", e)
-    if errs and not args.allow_shared_dst:
-        raise SystemExit("[中止] 预检未通过，未移动任何文件。")
+    if hard:
+        for e in hard:
+            print("    [错误]", e)
+        raise SystemExit("[中止] 存在不可绕过的预检错误（--allow-shared-dst 也不能放行）。")
+    if shared:
+        for e in shared:
+            print("    [风险]", e)
+        if not args.allow_shared_dst:
+            raise SystemExit("[中止] 存在共享目标风险。确认为多版本件共存时加 --allow-shared-dst 放行（仅放行此项）。")
 
     import json, shutil, datetime
     moved = renamed = 0
     if args.execute:
+        n_before = sum(len(fs) for r_, d_, fs in os.walk(root) if "归档整理" not in r_.split(os.sep))
+        batch = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
         was = ensure_unlocked(root)
         try:
             with open(journal_path, "a", encoding="utf-8") as jf:
@@ -122,6 +148,7 @@ def main():
                     shutil.move(s_abs, final)
                     jf.write(json.dumps({
                         "time": datetime.datetime.now().isoformat(timespec="seconds"),
+                        "batch": batch,
                         "src": s, "dst": os.path.relpath(final, root)}, ensure_ascii=False) + "\n")
                     jf.flush()
                     moved += 1
@@ -140,8 +167,11 @@ def main():
             do_snapshot(root)  # 与 ao_classify 同：执行成功即刷新基线（须在 relock 前）
         finally:
             relock(root, was)
-        print(f"✓ 移动 {moved} 个，序号共存 {renamed} 个，清理空目录 {pruned} 个。")
-        print(f"  日志: {journal_path}（ao_classify --root {root} --undo 可整体回滚）")
+        n_after = sum(len(fs) for r_, d_, fs in os.walk(root) if "归档整理" not in r_.split(os.sep))
+        verdict = "守恒 ✓" if n_before == n_after else "有增减，请核对！"
+        print(f"✓ 批次 {batch}：移动 {moved} 个（跳过源已消失 {len(pairs) - moved}，序号共存 {renamed}，清理空目录 {pruned}）。")
+        print(f"  终验：文件总数 执行前 {n_before} → 执行后 {n_after}（{verdict}）")
+        print(f"  日志: {journal_path}（ao_classify --root {root} --undo-last 只回滚本批次；--undo 回滚全部）")
     else:
         print("→ 干跑预览通过。加 --execute 执行。")
 

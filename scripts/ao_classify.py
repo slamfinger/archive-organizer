@@ -18,6 +18,7 @@
 """
 import os
 import argparse
+import datetime
 
 from ao_common import (Excludes, walk_rel, ensure_inside, unique_dst,
                        move_file, Journal, read_csv_rows, workdir, WORKDIR_NAME)
@@ -91,7 +92,7 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
     return plan
 
 
-def apply_plan(plan, root, journal_path, confirm=False):
+def apply_plan(plan, root, journal_path, confirm=False, batch=None):
     journal = Journal(journal_path)
     moved = skipped = 0
     touched_rules = set()  # 真正搬走文件的规则，事后才清理其源目录空壳
@@ -109,7 +110,7 @@ def apply_plan(plan, root, journal_path, confirm=False):
             final = move_file(src_abs, dst_abs)
             note = "" if final == dst_abs else f"  (重名→{os.path.basename(final)})"
             print(f"  [{i + 1}/{len(plan)}] {rel_src} → {os.path.relpath(final, root)}{note}")
-            journal.log(rel_src, os.path.relpath(final, root))
+            journal.log(rel_src, os.path.relpath(final, root), batch=batch)
             touched_rules.add(idx)
             moved += 1
     finally:
@@ -155,7 +156,8 @@ def do_execute(rules, root, ex, args, prot=frozenset()):
         print("→ 当前为干跑预览。确认无误后加 --execute 真正执行。")
         return
 
-    moved, skipped, touched = apply_plan(plan, root, args.journal, confirm=args.confirm)
+    batch = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
+    moved, skipped, touched = apply_plan(plan, root, args.journal, confirm=args.confirm, batch=batch)
     # 源目录若已搬空，清掉残留空壳（只清真搬过文件的，不动原有空目录）
     for idx in touched:
         action, src, dst = rules[idx]
@@ -163,16 +165,13 @@ def do_execute(rules, root, ex, args, prot=frozenset()):
             src_abs = os.path.join(root, src)
             if os.path.isdir(src_abs):
                 prune_empty_dirs(src_abs, root)
-    print(f"✓ 已移动 {moved} 个文件（跳过 {skipped} 个已消失），日志: {os.path.abspath(args.journal)}")
-    print("→ 如需撤销: 同命令加 --undo")
+    print(f"✓ 批次 {batch}：已移动 {moved} 个文件（跳过 {skipped} 个已消失），日志: {os.path.abspath(args.journal)}")
+    print("→ 如需撤销: 同命令加 --undo-last（只回滚本批次）或 --undo（回滚全部）")
     if args.execute:
         do_snapshot(root)  # 执行成功即刷新位置基线，供下轮增量/人工调整检测
 
 
-def do_undo(root, args):
-    entries = Journal.entries(args.journal)
-    if not entries:
-        raise SystemExit(f"[错误] 日志为空或不存在: {args.journal}")
+def undo_entries(root, entries):
     undone = 0
     for e in reversed(entries):  # 逆序回滚
         src_abs = os.path.join(root, e["src"])
@@ -187,7 +186,55 @@ def do_undo(root, args):
         prune_empty_dirs(dst_abs, root)  # 执行时新建的目标目录，回滚后顺手清空壳
         print(f"  {e['dst']} → {os.path.relpath(src_abs, root)}")
         undone += 1
-    print(f"✓ 已回滚 {undone}/{len(entries)} 条移动。日志保留（可重复 --undo 追溯更早一轮）。")
+    print(f"✓ 已回滚 {undone}/{len(entries)} 条移动。日志保留（可重复回滚追溯更早批次）。")
+
+
+def do_undo(root, args):
+    entries = Journal.entries(args.journal)
+    if not entries:
+        raise SystemExit(f"[错误] 日志为空或不存在: {args.journal}")
+    undo_entries(root, entries)
+
+
+def do_undo_last(root, args):
+    """只回滚最近一次执行（按日志里最后一个批次号；旧版日志无批次号则等同整体回滚）。"""
+    entries = Journal.entries(args.journal)
+    if not entries:
+        raise SystemExit(f"[错误] 日志为空或不存在: {args.journal}")
+    last = entries[-1].get("batch")
+    if not last:
+        print("[提示] 日志为旧版格式（无批次号），--undo-last 等同于整体回滚。")
+        undo_entries(root, entries)
+        return
+    subset = [e for e in entries if e.get("batch") == last]
+    undo_entries(root, subset)
+
+
+def do_undo_batch(root, args, bid):
+    entries = [e for e in Journal.entries(args.journal) if e.get("batch") == bid]
+    if not entries:
+        raise SystemExit(f"[错误] 日志中没有批次 {bid}（用 --list-batches 查看）")
+    undo_entries(root, entries)
+
+
+def do_list_batches(root, args):
+    entries = Journal.entries(args.journal)
+    if not entries:
+        raise SystemExit(f"[错误] 日志为空或不存在: {args.journal}")
+    groups = {}
+    order = []
+    for e in entries:
+        b = e.get("batch") or "(旧版无批次)"
+        if b not in groups:
+            groups[b] = {"n": 0, "t0": e["time"], "t1": e["time"], "first": e["src"]}
+            order.append(b)
+        groups[b]["n"] += 1
+        groups[b]["t1"] = e["time"]
+    print(f"共 {len(entries)} 条移动，{len(order)} 个批次：")
+    for b in order:
+        g = groups[b]
+        print(f"  {b}  {g['n']:>5} 条  {g['t0']} ~ {g['t1']}  首条: {g['first'][:60]}")
+    print("→ 回滚指定批次: --undo-batch <批次号>；回滚最近一批: --undo-last")
 
 
 def main():
@@ -198,6 +245,9 @@ def main():
     ap.add_argument("--execute", action="store_true", help="真正执行移动（缺省只干跑预览）")
     ap.add_argument("--confirm", action="store_true", help="执行前逐项确认")
     ap.add_argument("--undo", action="store_true", help="按日志逆序回滚全部移动")
+    ap.add_argument("--undo-last", action="store_true", help="只回滚最近一次执行（最近批次）")
+    ap.add_argument("--undo-batch", default=None, metavar="ID", help="回滚指定批次")
+    ap.add_argument("--list-batches", action="store_true", help="列出日志中的全部批次")
     ap.add_argument("--journal", default=None,
                     help="移动日志路径（默认 <root>/归档整理/.ao_journal.jsonl）")
     ap.add_argument("--samples", type=int, default=5, help="干跑时每类展示的样例数（默认5）")
@@ -215,6 +265,15 @@ def main():
 
     if args.undo:
         do_undo(root, args)
+        return
+    if args.undo_last:
+        do_undo_last(root, args)
+        return
+    if args.undo_batch:
+        do_undo_batch(root, args, args.undo_batch)
+        return
+    if args.list_batches:
+        do_list_batches(root, args)
         return
 
     if not os.path.exists(args.rules):
