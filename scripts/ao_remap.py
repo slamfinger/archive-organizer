@@ -22,7 +22,7 @@ import csv
 import argparse
 from collections import Counter, defaultdict
 
-from ao_common import workdir, read_csv_rows, WORKDIR_NAME
+from ao_common import workdir, read_csv_rows, WORKDIR_NAME, norm_name
 from ao_protect import ensure_unlocked, relock
 
 JUNK_PREFIX = ("~$", "._")
@@ -31,11 +31,6 @@ JUNK_NAMES = {".DS_Store", "Thumbs.db", "desktop.ini"}
 
 def is_junk(name):
     return name in JUNK_NAMES or name.startswith(JUNK_PREFIX)
-
-
-def norm(name):
-    """匹配归一：去所有空白（含全角空格）。"""
-    return "".join(name.split())
 
 
 def load_rules(path):
@@ -96,7 +91,7 @@ def report(rules_path, out_path, root, wd, rules, args):
         d_[:] = [x for x in d_ if x != WORKDIR_NAME and not x.startswith(".")]
         for fn in sorted(f_):
             rel = os.path.relpath(os.path.join(r_, fn), root)
-            nfn = norm(fn)
+            nfn = norm_name(fn)
             if is_junk(fn) or any(k and (k in rel or k in nfn) for k, _p in rules["留守"]):
                 kept_back.append(rel)
                 continue

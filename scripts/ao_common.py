@@ -118,6 +118,20 @@ def move_file(src_abs, dst_abs):
     return final
 
 
+def norm_name(s):
+    """文件名匹配归一：去所有空白（含全角空格）。学习器/执行器/重排器共用同一实现。"""
+    return "".join(s.split())
+
+
+def dir_contains(parent_abs, child_abs):
+    """child 等于或位于 parent 内部时为 True（目录安全判断共享实现）。"""
+    parent_abs, child_abs = os.path.abspath(parent_abs), os.path.abspath(child_abs)
+    try:
+        return os.path.commonpath([parent_abs, child_abs]) == parent_abs
+    except ValueError:  # Windows 跨盘等场景
+        return False
+
+
 # ---------- 移动日志（journal / undo，借鉴 organize 工具） ----------
 class Journal:
     def __init__(self, path, enabled=True):

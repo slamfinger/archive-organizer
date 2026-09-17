@@ -19,14 +19,10 @@ import argparse
 from collections import defaultdict, Counter
 
 from ao_common import (Excludes, walk_rel, workdir, read_csv_rows,
-                       extract_runs, WORKDIR_NAME)
+                       extract_runs, norm_name, dir_contains, WORKDIR_NAME)
 from ao_protect import ensure_unlocked, relock
 
 SNAP = ".位置快照.json"
-
-
-def norm(name):
-    return "".join(name.split())
 
 
 def moved_pairs(root, snap_path):
@@ -39,14 +35,18 @@ def moved_pairs(root, snap_path):
         base_keys[(os.path.basename(r), s)].append(r)
     ex = Excludes()
     ex.names.add(WORKDIR_NAME)
-    pairs = []
+    pairs, ambiguous = [], []
     for kind, rel, a in walk_rel(root, ex):
         if kind != "f" or rel in base:
             continue
         olds = base_keys.get((os.path.basename(rel), os.path.getsize(a)))
-        if olds:
-            pairs.append((olds[0], rel))
-    return pairs
+        if not olds:
+            continue
+        if len(olds) > 1:
+            ambiguous.append((rel, olds))  # 审计P1-1：同名同大小多候选，来源歧义拒学防污染
+            continue
+        pairs.append((olds[0], rel))
+    return pairs, ambiguous, base
 
 
 def load_known(paths):
@@ -60,10 +60,16 @@ def load_known(paths):
     return known
 
 
-def learn(pairs, root, min_dir, min_kw, known):
+def learn(pairs, root, min_dir, min_kw, known, base):
     rules = []  # (动作, 源, 目标, 依据)
 
-    # ---- 1. 目录对规则：同一 (源目录→目标目录) 的样本达到阈值 → 整目录收编 ----
+    # ---- 1. 目录对规则：用户把源目录内容整体搬空（样本=基线全量）才学「整目录收编」；
+    #         只搬了零散几件的，不学目录级规则（防域根过度泛化），交给关键词规则 ----
+    base_under_subtree = Counter()
+    for r in base:
+        parts = r.split(os.sep)
+        for i in range(len(parts) - 1):          # 基线文件计入其每一层祖先目录的“子树全量”
+            base_under_subtree[os.sep.join(parts[:i + 1])] += 1
     dir_groups = defaultdict(list)
     for o, n in pairs:
         sd, dd = os.path.dirname(o), os.path.dirname(n)
@@ -72,6 +78,12 @@ def learn(pairs, root, min_dir, min_kw, known):
     covered_old_dirs = set()
     for (sd, dd), samples in sorted(dir_groups.items(), key=lambda x: -len(x[1])):
         if len(samples) < min_dir:
+            continue
+        if len(samples) < base_under_subtree.get(sd, 0):
+            continue  # 源子树还有未搬走的文件——不是整目录归并，宁可不学
+        # 审计P0-2：与执行器同判——目标等于/位于源内部的规则，执行器会整体拒绝，提前跳过
+        if dir_contains(os.path.join(root, sd), os.path.join(root, dd)):
+            print(f"    [跳过] 目标等于/位于源内部，不学（样本{len(samples)}个）: {sd} → {dd}")
             continue
         rules.append(("移目录", sd, dd,
                       f"人工移位样本{len(samples)}个: " + "、".join(os.path.basename(n) for _o, n in samples[:4])
@@ -86,7 +98,7 @@ def learn(pairs, root, min_dir, min_kw, known):
         by_dst[os.path.dirname(n)].append(n)
     ex = Excludes()
     ex.names.add(WORKDIR_NAME)
-    tree_names = [norm(os.path.basename(rel)) for k, rel, _a in walk_rel(root, ex) if k == "f"]
+    tree_names = [norm_name(os.path.basename(rel)) for k, rel, _a in walk_rel(root, ex) if k == "f"]
 
     for dst_dir, samples in sorted(by_dst.items()):
         if len(samples) < min_kw:
@@ -105,7 +117,7 @@ def learn(pairs, root, min_dir, min_kw, known):
             if total > sup:
                 continue  # 该词在树里还出现在非样本文件上 → 有误伤风险，不学
             rules.append(("移文件", kw, dst_dir,
-                          f"零误伤词（全树仅{total}处，全在本组{sup}个样本中）: "
+                          f"当前树未发现误伤（全树仅{total}处，全在本组{sup}个样本中；新文件含该词将同归此目录）: "
                           + "、".join(sorted(os.path.basename(r) for r in run_where[kw])[:4])
                           + ("…" if len(run_where[kw]) > 4 else "")))
             covered |= run_where[kw]
@@ -134,23 +146,33 @@ def main():
     known_paths = args.known or [os.path.join(wd, "归档规则.csv")]
     known_paths.append(out_path)
 
-    pairs = moved_pairs(root, os.path.join(wd, SNAP))
+    pairs, ambiguous, base = moved_pairs(root, os.path.join(wd, SNAP))
     print(f"人工调整教学样本: {len(pairs)} 对移位")
     if args.detail:
         for o, n in pairs:
             print(f"   {o[:60]} → {n[:60]}")
+    if ambiguous:
+        print(f"歧义拒学 {len(ambiguous)} 个（同名同大小多候选，防止污染学习样本）:")
+        for rel, olds in ambiguous[:8]:
+            print(f"   ? {rel[:66]}  ← 候选来源: {' ; '.join(o[:40] for o in olds)}")
 
     known = load_known(known_paths)
+    existing = []
+    if os.path.exists(out_path):  # 学习规则增量合并：历史规则保留，只追加新学到的
+        existing = read_csv_rows(out_path)[1:]
     was = ensure_unlocked(root)
     try:
-        rules = learn(pairs, root, args.min_dir, args.min_kw, known)
+        new_rules = learn(pairs, root, args.min_dir, args.min_kw, known, base)
         with open(out_path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
             w.writerow(["动作", "源", "目标", "依据"])
-            for r in rules:
+            for r in existing:
+                w.writerow(r)
+            for r in new_rules:
                 w.writerow(r)
     finally:
         relock(root, was)
+    rules = existing + new_rules
 
     print(f"\n提炼学习规则 {len(rules)} 条 → {out_path}")
     for act, src, dst, why in rules:

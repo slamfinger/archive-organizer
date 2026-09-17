@@ -19,9 +19,11 @@
 import os
 import argparse
 import datetime
+from collections import defaultdict
 
 from ao_common import (Excludes, walk_rel, ensure_inside, unique_dst,
-                       move_file, Journal, read_csv_rows, workdir, WORKDIR_NAME)
+                       move_file, Journal, read_csv_rows, workdir, WORKDIR_NAME,
+                       norm_name, dir_contains)
 from ao_protect import ensure_unlocked, relock
 from ao_state import load_protect, protect_key, do_snapshot
 
@@ -62,7 +64,7 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
         ensure_inside(root, dst_abs)
         if action == "移文件":
             for kind, rel, abs_ in walk_rel(root, ex):
-                if kind != "f" or src not in os.path.basename(rel):
+                if kind != "f" or src not in norm_name(os.path.basename(rel)):
                     continue
                 if os.path.dirname(abs_) == dst_abs:
                     continue  # 已在目标目录，跳过
@@ -76,7 +78,7 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
             print(f"[警告] 规则{idx + 1}: 源目录不存在，跳过 → {src}")
             continue
         ensure_inside(root, src_abs)
-        if src_abs == dst_abs or os.path.commonpath([src_abs, dst_abs]) == src_abs:
+        if src_abs == dst_abs or dir_contains(src_abs, dst_abs):
             raise SystemExit(f"[拒绝] 规则{idx + 1}: 目标不能等于/位于源内部 → {dst}")
         keep = (action == "移目录")
         for kind, rel, abs_ in walk_rel(src_abs, ex):
@@ -89,6 +91,20 @@ def collect_rules_moves(rules, root, ex, prot=frozenset()):
             plan.append((idx, abs_, os.path.join(dst_abs, tail)))
     if n_prot:
         print(f"[保护] 按人工保护清单跳过 {n_prot} 个文件（人工调整不回改）")
+    # 冲突可见化：被多条规则命中（目标不同）的文件，干跑阶段列给人看。
+    # 裁决仍按既定契约「规则顺序先到先得」，不阻断——要改顺序请调整规则表。
+    multi = defaultdict(set)
+    for idx, s_abs, d_abs in plan:
+        multi[s_abs].add((idx, os.path.relpath(d_abs, root)))
+    conflicts = {s: v for s, v in multi.items() if len({d for _i, d in v}) > 1}
+    if conflicts:
+        print(f"[冲突提示] {len(conflicts)} 个文件被多条规则命中（目标不同），按规则顺序先到先得：")
+        for s, v in list(sorted(conflicts.items()))[:8]:
+            print(f"    {os.path.relpath(s, root)[:66]}")
+            for idx, d in sorted(v):
+                print(f"        规则{idx + 1} → {d[:70]}")
+        if len(conflicts) > 8:
+            print(f"    …（其余 {len(conflicts) - 8} 个略）")
     return plan
 
 
@@ -120,9 +136,14 @@ def apply_plan(plan, root, journal_path, confirm=False, batch=None):
 
 def prune_empty_dirs(start_abs, stop_abs):
     """自底向上清理空壳目录：先清 start 子树内的空目录，再向上清到 stop。
-    目录已消失视为可继续向上；任何非空目录立即停（隐藏文件也算占用）。"""
+    目录已消失视为可继续向上；任何非空目录立即停（隐藏文件也算占用）。
+    start 允许传入文件路径（回滚后的日志目标），自动从其所在目录开始。"""
     stop = os.path.abspath(stop_abs)
     cur = os.path.abspath(start_abs)
+    if os.path.isfile(cur):
+        cur = os.path.dirname(cur)   # 审计P0-1：日志目标是文件，不能对文件 listdir
+    if not os.path.isdir(cur):
+        return
     for dirpath, _, _ in os.walk(cur, topdown=False):
         try:
             if not os.listdir(dirpath):
@@ -131,10 +152,11 @@ def prune_empty_dirs(start_abs, stop_abs):
                 break
         except OSError:
             break
-    while cur != stop and (not os.path.exists(cur) or not os.listdir(cur)):
+    while cur != stop:
         try:
-            if os.path.exists(cur):
-                os.rmdir(cur)
+            if os.listdir(cur):
+                break
+            os.rmdir(cur)
         except OSError:
             break
         cur = os.path.dirname(cur)
