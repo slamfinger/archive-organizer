@@ -16,7 +16,7 @@ import os
 import argparse
 from collections import Counter
 
-from ao_common import ensure_inside, workdir, read_csv_rows, WORKDIR_NAME
+from ao_common import ensure_inside, prune_empty_chain, workdir, read_csv_rows, WORKDIR_NAME
 from ao_protect import ensure_unlocked, relock
 from ao_state import do_snapshot, load_protect, protect_key
 
@@ -142,6 +142,7 @@ def main():
         batch = datetime.datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}"
         was = ensure_unlocked(root)
         try:
+            src_dirs = set()  # 本批实际移动的源目录：清理只沿这些父链，不扫全树
             with open(journal_path, "a", encoding="utf-8") as jf:
                 for i, (s, d, _sz) in enumerate(pairs, 1):
                     s_abs, d_abs = os.path.join(root, s), os.path.join(root, d)
@@ -158,24 +159,17 @@ def main():
                         renamed += 1
                     os.makedirs(os.path.dirname(final), exist_ok=True)
                     shutil.move(s_abs, final)
+                    src_dirs.add(os.path.dirname(s_abs))
                     jf.write(json.dumps({
                         "time": datetime.datetime.now().isoformat(timespec="seconds"),
                         "batch": batch,
                         "src": s, "dst": os.path.relpath(final, root)}, ensure_ascii=False) + "\n")
                     jf.flush()
                     moved += 1
-                    if i % 300 == 0:
-                        print(f"  … {i}/{len(pairs)}")
+            # 只沿本批移动源的父链自底向上清空壳；预存空目录（链外或链上非空）不受影响
             pruned = 0
-            for dirpath, dnames, _ in os.walk(root, topdown=False):
-                if os.path.abspath(dirpath) == root or WORKDIR_NAME in dirpath.split(os.sep):
-                    continue
-                try:
-                    if not os.listdir(dirpath):
-                        os.rmdir(dirpath)
-                        pruned += 1
-                except OSError:
-                    pass
+            for d0 in sorted(src_dirs, key=len, reverse=True):
+                pruned += prune_empty_chain(d0, root)
             do_snapshot(root)  # 与 ao_classify 同：执行成功即刷新基线（须在 relock 前）
         finally:
             relock(root, was)

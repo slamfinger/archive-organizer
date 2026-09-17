@@ -124,6 +124,29 @@ def norm_name(s):
     return "".join(s.split())
 
 
+def prune_empty_chain(start_dir_abs, stop_dir_abs):
+    """从 start 目录沿父链向上，删除空目录（或已消失的目录壳），直到 stop 或遇非空。
+    只清理链上目录，不做子树遍历——不会触碰链外的任何目录（含预存空目录）。
+    返回删除的目录数。"""
+    stop = os.path.abspath(stop_dir_abs)
+    cur = os.path.abspath(start_dir_abs)
+    removed = 0
+    while cur != stop:
+        try:
+            if os.path.exists(cur) and os.listdir(cur):
+                break
+        except OSError:
+            break
+        try:
+            if os.path.exists(cur):
+                os.rmdir(cur)
+                removed += 1
+        except OSError:
+            break
+        cur = os.path.dirname(cur)
+    return removed
+
+
 def dir_contains(parent_abs, child_abs):
     """child 等于或位于 parent 内部时为 True（目录安全判断共享实现）。"""
     parent_abs, child_abs = os.path.abspath(parent_abs), os.path.abspath(child_abs)
